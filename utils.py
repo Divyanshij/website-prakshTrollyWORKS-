@@ -1,340 +1,244 @@
-import datetime
-import decimal
-import functools
-import logging
-import time
-import warnings
-from contextlib import contextmanager
-from hashlib import md5
+import json
+from collections import UserList
 
-from django.apps import apps
-from django.db import NotSupportedError
-from django.utils.dateparse import parse_time
-
-logger = logging.getLogger("django.db.backends")
+from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.forms.renderers import get_default_renderer
+from django.utils import timezone
+from django.utils.html import escape, format_html_join
+from django.utils.safestring import mark_safe
+from django.utils.translation import gettext_lazy as _
 
 
-class CursorWrapper:
-    def __init__(self, cursor, db):
-        self.cursor = cursor
-        self.db = db
+def pretty_name(name):
+    """Convert 'first_name' to 'First name'."""
+    if not name:
+        return ""
+    return name.replace("_", " ").capitalize()
 
-    WRAP_ERROR_ATTRS = frozenset(["fetchone", "fetchmany", "fetchall", "nextset"])
 
-    APPS_NOT_READY_WARNING_MSG = (
-        "Accessing the database during app initialization is discouraged. To fix this "
-        "warning, avoid executing queries in AppConfig.ready() or when your app "
-        "modules are imported."
+def flatatt(attrs):
+    """
+    Convert a dictionary of attributes to a single string.
+    The returned string will contain a leading space followed by key="value",
+    XML-style pairs. In the case of a boolean value, the key will appear
+    without a value. It is assumed that the keys do not need to be
+    XML-escaped. If the passed dictionary is empty, then return an empty
+    string.
+
+    The result is passed through 'mark_safe' (by way of 'format_html_join').
+    """
+    key_value_attrs = []
+    boolean_attrs = []
+    for attr, value in attrs.items():
+        if isinstance(value, bool):
+            if value:
+                boolean_attrs.append((attr,))
+        elif value is not None:
+            key_value_attrs.append((attr, value))
+
+    return format_html_join("", ' {}="{}"', sorted(key_value_attrs)) + format_html_join(
+        "", " {}", sorted(boolean_attrs)
     )
 
-    def __getattr__(self, attr):
-        cursor_attr = getattr(self.cursor, attr)
-        if attr in CursorWrapper.WRAP_ERROR_ATTRS:
-            return self.db.wrap_database_errors(cursor_attr)
+
+class RenderableMixin:
+    def get_context(self):
+        raise NotImplementedError(
+            "Subclasses of RenderableMixin must provide a get_context() method."
+        )
+
+    def render(self, template_name=None, context=None, renderer=None):
+        renderer = renderer or self.renderer
+        template = template_name or self.template_name
+        context = context or self.get_context()
+        return mark_safe(renderer.render(template, context))
+
+    __str__ = render
+    __html__ = render
+
+
+class RenderableFieldMixin(RenderableMixin):
+    def as_field_group(self):
+        return self.render()
+
+    def as_hidden(self):
+        raise NotImplementedError(
+            "Subclasses of RenderableFieldMixin must provide an as_hidden() method."
+        )
+
+    def as_widget(self):
+        raise NotImplementedError(
+            "Subclasses of RenderableFieldMixin must provide an as_widget() method."
+        )
+
+    def __str__(self):
+        """Render this field as an HTML widget."""
+        if self.field.show_hidden_initial:
+            return self.as_widget() + self.as_hidden(only_initial=True)
+        return self.as_widget()
+
+    __html__ = __str__
+
+
+class RenderableFormMixin(RenderableMixin):
+    def as_p(self):
+        """Render as <p> elements."""
+        return self.render(self.template_name_p)
+
+    def as_table(self):
+        """Render as <tr> elements excluding the surrounding <table> tag."""
+        return self.render(self.template_name_table)
+
+    def as_ul(self):
+        """Render as <li> elements excluding the surrounding <ul> tag."""
+        return self.render(self.template_name_ul)
+
+    def as_div(self):
+        """Render as <div> elements."""
+        return self.render(self.template_name_div)
+
+
+class RenderableErrorMixin(RenderableMixin):
+    def as_json(self, escape_html=False):
+        return json.dumps(self.get_json_data(escape_html))
+
+    def as_text(self):
+        return self.render(self.template_name_text)
+
+    def as_ul(self):
+        return self.render(self.template_name_ul)
+
+
+class ErrorDict(dict, RenderableErrorMixin):
+    """
+    A collection of errors that knows how to display itself in various formats.
+
+    The dictionary keys are the field names, and the values are the errors.
+    """
+
+    template_name = "django/forms/errors/dict/default.html"
+    template_name_text = "django/forms/errors/dict/text.txt"
+    template_name_ul = "django/forms/errors/dict/ul.html"
+
+    def __init__(self, *args, renderer=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.renderer = renderer or get_default_renderer()
+
+    def as_data(self):
+        return {f: e.as_data() for f, e in self.items()}
+
+    def get_json_data(self, escape_html=False):
+        return {f: e.get_json_data(escape_html) for f, e in self.items()}
+
+    def get_context(self):
+        return {
+            "errors": self.items(),
+            "error_class": "errorlist",
+        }
+
+
+class ErrorList(UserList, list, RenderableErrorMixin):
+    """
+    A collection of errors that knows how to display itself in various formats.
+    """
+
+    template_name = "django/forms/errors/list/default.html"
+    template_name_text = "django/forms/errors/list/text.txt"
+    template_name_ul = "django/forms/errors/list/ul.html"
+
+    def __init__(self, initlist=None, error_class=None, renderer=None):
+        super().__init__(initlist)
+
+        if error_class is None:
+            self.error_class = "errorlist"
         else:
-            return cursor_attr
+            self.error_class = "errorlist {}".format(error_class)
+        self.renderer = renderer or get_default_renderer()
 
-    def __iter__(self):
-        with self.db.wrap_database_errors:
-            yield from self.cursor
+    def as_data(self):
+        return ValidationError(self.data).error_list
 
-    def __enter__(self):
-        return self
+    def copy(self):
+        copy = super().copy()
+        copy.error_class = self.error_class
+        return copy
 
-    def __exit__(self, type, value, traceback):
-        # Close instead of passing through to avoid backend-specific behavior
-        # (#17671). Catch errors liberally because errors in cleanup code
-        # aren't useful.
-        try:
-            self.close()
-        except self.db.Database.Error:
-            pass
-
-    # The following methods cannot be implemented in __getattr__, because the
-    # code must run when the method is invoked, not just when it is accessed.
-
-    def callproc(self, procname, params=None, kparams=None):
-        # Keyword parameters for callproc aren't supported in PEP 249, but the
-        # database driver may support them (e.g. oracledb).
-        if kparams is not None and not self.db.features.supports_callproc_kwargs:
-            raise NotSupportedError(
-                "Keyword parameters for callproc are not supported on this "
-                "database backend."
-            )
-        # Raise a warning during app initialization (stored_app_configs is only
-        # ever set during testing).
-        if not apps.ready and not apps.stored_app_configs:
-            warnings.warn(self.APPS_NOT_READY_WARNING_MSG, category=RuntimeWarning)
-        self.db.validate_no_broken_transaction()
-        with self.db.wrap_database_errors:
-            if params is None and kparams is None:
-                return self.cursor.callproc(procname)
-            elif kparams is None:
-                return self.cursor.callproc(procname, params)
-            else:
-                params = params or ()
-                return self.cursor.callproc(procname, params, kparams)
-
-    def execute(self, sql, params=None):
-        return self._execute_with_wrappers(
-            sql, params, many=False, executor=self._execute
-        )
-
-    def executemany(self, sql, param_list):
-        return self._execute_with_wrappers(
-            sql, param_list, many=True, executor=self._executemany
-        )
-
-    def _execute_with_wrappers(self, sql, params, many, executor):
-        context = {"connection": self.db, "cursor": self}
-        for wrapper in reversed(self.db.execute_wrappers):
-            executor = functools.partial(wrapper, executor)
-        return executor(sql, params, many, context)
-
-    def _execute(self, sql, params, *ignored_wrapper_args):
-        # Raise a warning during app initialization (stored_app_configs is only
-        # ever set during testing).
-        if not apps.ready and not apps.stored_app_configs:
-            warnings.warn(self.APPS_NOT_READY_WARNING_MSG, category=RuntimeWarning)
-        self.db.validate_no_broken_transaction()
-        with self.db.wrap_database_errors:
-            if params is None:
-                # params default might be backend specific.
-                return self.cursor.execute(sql)
-            else:
-                return self.cursor.execute(sql, params)
-
-    def _executemany(self, sql, param_list, *ignored_wrapper_args):
-        # Raise a warning during app initialization (stored_app_configs is only
-        # ever set during testing).
-        if not apps.ready and not apps.stored_app_configs:
-            warnings.warn(self.APPS_NOT_READY_WARNING_MSG, category=RuntimeWarning)
-        self.db.validate_no_broken_transaction()
-        with self.db.wrap_database_errors:
-            return self.cursor.executemany(sql, param_list)
-
-
-class CursorDebugWrapper(CursorWrapper):
-    # XXX callproc isn't instrumented at this time.
-
-    def execute(self, sql, params=None):
-        with self.debug_sql(sql, params, use_last_executed_query=True):
-            return super().execute(sql, params)
-
-    def executemany(self, sql, param_list):
-        with self.debug_sql(sql, param_list, many=True):
-            return super().executemany(sql, param_list)
-
-    @contextmanager
-    def debug_sql(
-        self, sql=None, params=None, use_last_executed_query=False, many=False
-    ):
-        start = time.monotonic()
-        try:
-            yield
-        finally:
-            stop = time.monotonic()
-            duration = stop - start
-            if use_last_executed_query:
-                sql = self.db.ops.last_executed_query(self.cursor, sql, params)
-            try:
-                times = len(params) if many else ""
-            except TypeError:
-                # params could be an iterator.
-                times = "?"
-            self.db.queries_log.append(
+    def get_json_data(self, escape_html=False):
+        errors = []
+        for error in self.as_data():
+            message = next(iter(error))
+            errors.append(
                 {
-                    "sql": "%s times: %s" % (times, sql) if many else sql,
-                    "time": "%.3f" % duration,
+                    "message": escape(message) if escape_html else message,
+                    "code": error.code or "",
                 }
             )
-            logger.debug(
-                "(%.3f) %s; args=%s; alias=%s",
-                duration,
-                sql,
-                params,
-                self.db.alias,
-                extra={
-                    "duration": duration,
-                    "sql": sql,
-                    "params": params,
-                    "alias": self.db.alias,
-                },
-            )
+        return errors
+
+    def get_context(self):
+        return {
+            "errors": self,
+            "error_class": self.error_class,
+        }
+
+    def __repr__(self):
+        return repr(list(self))
+
+    def __contains__(self, item):
+        return item in list(self)
+
+    def __eq__(self, other):
+        return list(self) == other
+
+    def __getitem__(self, i):
+        error = self.data[i]
+        if isinstance(error, ValidationError):
+            return next(iter(error))
+        return error
+
+    def __reduce_ex__(self, *args, **kwargs):
+        # The `list` reduce function returns an iterator as the fourth element
+        # that is normally used for repopulating. Since we only inherit from
+        # `list` for `isinstance` backward compatibility (Refs #17413) we
+        # nullify this iterator as it would otherwise result in duplicate
+        # entries. (Refs #23594)
+        info = super(UserList, self).__reduce_ex__(*args, **kwargs)
+        return info[:3] + (None, None)
 
 
-@contextmanager
-def debug_transaction(connection, sql):
-    start = time.monotonic()
-    try:
-        yield
-    finally:
-        if connection.queries_logged:
-            stop = time.monotonic()
-            duration = stop - start
-            connection.queries_log.append(
-                {
-                    "sql": "%s" % sql,
-                    "time": "%.3f" % duration,
-                }
-            )
-            logger.debug(
-                "(%.3f) %s; args=%s; alias=%s",
-                duration,
-                sql,
-                None,
-                connection.alias,
-                extra={
-                    "duration": duration,
-                    "sql": sql,
-                    "alias": connection.alias,
-                },
-            )
+# Utilities for time zone support in DateTimeField et al.
 
 
-def split_tzname_delta(tzname):
+def from_current_timezone(value):
     """
-    Split a time zone name into a 3-tuple of (name, sign, offset).
+    When time zone support is enabled, convert naive datetimes
+    entered in the current time zone to aware datetimes.
     """
-    for sign in ["+", "-"]:
-        if sign in tzname:
-            name, offset = tzname.rsplit(sign, 1)
-            if offset and parse_time(offset):
-                return name, sign, offset
-    return tzname, None, None
+    if settings.USE_TZ and value is not None and timezone.is_naive(value):
+        current_timezone = timezone.get_current_timezone()
+        try:
+            if timezone._datetime_ambiguous_or_imaginary(value, current_timezone):
+                raise ValueError("Ambiguous or non-existent time.")
+            return timezone.make_aware(value, current_timezone)
+        except Exception as exc:
+            raise ValidationError(
+                _(
+                    "%(datetime)s couldn’t be interpreted "
+                    "in time zone %(current_timezone)s; it "
+                    "may be ambiguous or it may not exist."
+                ),
+                code="ambiguous_timezone",
+                params={"datetime": value, "current_timezone": current_timezone},
+            ) from exc
+    return value
 
 
-###############################################
-# Converters from database (string) to Python #
-###############################################
-
-
-def typecast_date(s):
-    return (
-        datetime.date(*map(int, s.split("-"))) if s else None
-    )  # return None if s is null
-
-
-def typecast_time(s):  # does NOT store time zone information
-    if not s:
-        return None
-    hour, minutes, seconds = s.split(":")
-    if "." in seconds:  # check whether seconds have a fractional part
-        seconds, microseconds = seconds.split(".")
-    else:
-        microseconds = "0"
-    return datetime.time(
-        int(hour), int(minutes), int(seconds), int((microseconds + "000000")[:6])
-    )
-
-
-def typecast_timestamp(s):  # does NOT store time zone information
-    # "2005-07-29 15:48:00.590358-05"
-    # "2005-07-29 09:56:00-05"
-    if not s:
-        return None
-    if " " not in s:
-        return typecast_date(s)
-    d, t = s.split()
-    # Remove timezone information.
-    if "-" in t:
-        t, _ = t.split("-", 1)
-    elif "+" in t:
-        t, _ = t.split("+", 1)
-    dates = d.split("-")
-    times = t.split(":")
-    seconds = times[2]
-    if "." in seconds:  # check whether seconds have a fractional part
-        seconds, microseconds = seconds.split(".")
-    else:
-        microseconds = "0"
-    return datetime.datetime(
-        int(dates[0]),
-        int(dates[1]),
-        int(dates[2]),
-        int(times[0]),
-        int(times[1]),
-        int(seconds),
-        int((microseconds + "000000")[:6]),
-    )
-
-
-###############################################
-# Converters from Python to database (string) #
-###############################################
-
-
-def split_identifier(identifier):
+def to_current_timezone(value):
     """
-    Split an SQL identifier into a two element tuple of (namespace, name).
-
-    The identifier could be a table, column, or sequence name might be prefixed
-    by a namespace.
+    When time zone support is enabled, convert aware datetimes
+    to naive datetimes in the current time zone for display.
     """
-    try:
-        namespace, name = identifier.split('"."')
-    except ValueError:
-        namespace, name = "", identifier
-    return namespace.strip('"'), name.strip('"')
-
-
-def truncate_name(identifier, length=None, hash_len=4):
-    """
-    Shorten an SQL identifier to a repeatable mangled version with the given
-    length.
-
-    If a quote stripped name contains a namespace, e.g. USERNAME"."TABLE,
-    truncate the table portion only.
-    """
-    namespace, name = split_identifier(identifier)
-
-    if length is None or len(name) <= length:
-        return identifier
-
-    digest = names_digest(name, length=hash_len)
-    return "%s%s%s" % (
-        '%s"."' % namespace if namespace else "",
-        name[: length - hash_len],
-        digest,
-    )
-
-
-def names_digest(*args, length):
-    """
-    Generate a 32-bit digest of a set of arguments that can be used to shorten
-    identifying names.
-    """
-    h = md5(usedforsecurity=False)
-    for arg in args:
-        h.update(arg.encode())
-    return h.hexdigest()[:length]
-
-
-def format_number(value, max_digits, decimal_places):
-    """
-    Format a number into a string with the requisite number of digits and
-    decimal places.
-    """
-    if value is None:
-        return None
-    context = decimal.getcontext().copy()
-    if max_digits is not None:
-        context.prec = max_digits
-    if decimal_places is not None:
-        value = value.quantize(
-            decimal.Decimal(1).scaleb(-decimal_places), context=context
-        )
-    else:
-        context.traps[decimal.Rounded] = 1
-        value = context.create_decimal(value)
-    return "{:f}".format(value)
-
-
-def strip_quotes(table_name):
-    """
-    Strip quotes off of quoted table names to make them safe for use in index
-    names, sequence names, etc. For example '"USER"."TABLE"' (an Oracle naming
-    scheme) becomes 'USER"."TABLE'.
-    """
-    has_quotes = table_name.startswith('"') and table_name.endswith('"')
-    return table_name[1:-1] if has_quotes else table_name
+    if settings.USE_TZ and value is not None and timezone.is_aware(value):
+        return timezone.make_naive(value)
+    return value
