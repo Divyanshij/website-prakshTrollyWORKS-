@@ -87,26 +87,27 @@ except ImportError:
     # no write support, probably under GAE
     WRITE_SUPPORT = False
 
-from pip._internal.utils._jaraco_text import (
+from pkg_resources.extern.jaraco.text import (
     yield_lines,
     drop_comment,
     join_continuation,
 )
-from pip._vendor.packaging import markers as _packaging_markers
-from pip._vendor.packaging import requirements as _packaging_requirements
-from pip._vendor.packaging import utils as _packaging_utils
-from pip._vendor.packaging import version as _packaging_version
-from pip._vendor.platformdirs import user_cache_dir as _user_cache_dir
+from pkg_resources.extern.packaging import markers as _packaging_markers
+from pkg_resources.extern.packaging import requirements as _packaging_requirements
+from pkg_resources.extern.packaging import utils as _packaging_utils
+from pkg_resources.extern.packaging import version as _packaging_version
+from pkg_resources.extern.platformdirs import user_cache_dir as _user_cache_dir
 
 if TYPE_CHECKING:
     from _typeshed import BytesPath, StrPath, StrOrBytesPath
-    from pip._vendor.typing_extensions import Self
+    from typing_extensions import Self
 
-
-# Patch: Remove deprecation warning from vendored pkg_resources.
-# Setting PYTHONWARNINGS=error to verify builds produce no warnings
-# causes immediate exceptions.
-# See https://github.com/pypa/pip/issues/12243
+warnings.warn(
+    "pkg_resources is deprecated as an API. "
+    "See https://setuptools.pypa.io/en/latest/pkg_resources.html",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 
 _T = TypeVar("_T")
@@ -2040,7 +2041,7 @@ class ZipProvider(EggProvider):
 
         if not WRITE_SUPPORT:
             raise OSError(
-                '"os.rename" and "os.unlink" are not supported on this platform'
+                '"os.rename" and "os.unlink" are not supported ' 'on this platform'
             )
         try:
             if not self.egg_name:
@@ -2807,7 +2808,7 @@ class EntryPoint:
             return ()
         req = Requirement.parse('x' + extras_spec)
         if req.specs:
-            raise ValueError
+            raise ValueError()
         return req.extras
 
     @classmethod
